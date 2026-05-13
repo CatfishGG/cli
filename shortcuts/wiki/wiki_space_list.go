@@ -6,8 +6,18 @@ package wiki
 import (
 	"context"
 	"fmt"
+	"io"
+	"strconv"
+	"strings"
 
+	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/shortcuts/common"
+)
+
+const (
+	wikiSpaceListAPIPath        = "/open-apis/wiki/v2/spaces"
+	wikiSpaceListDefaultPageSiz = 50
+	wikiSpaceListMaxPageSize    = 50
 )
 
 // WikiSpaceList lists all wiki spaces the caller has access to.
@@ -16,46 +26,100 @@ var WikiSpaceList = common.Shortcut{
 	Command:     "+space-list",
 	Description: "List wiki spaces accessible to the caller",
 	Risk:        "read",
-	Scopes:      []string{"wiki:space:retrieve"},
+	Scopes:      []string{"wiki:wiki:readonly"},
 	AuthTypes:   []string{"user", "bot"},
-	Flags:       []common.Flag{},
+	HasFormat:   true,
+	Flags: []common.Flag{
+		{Name: "page-size", Type: "int", Default: strconv.Itoa(wikiSpaceListDefaultPageSiz), Desc: fmt.Sprintf("page size, 1-%d", wikiSpaceListMaxPageSize)},
+		{Name: "page-token", Desc: "page token; implies single-page fetch (no auto-pagination)"},
+		{Name: "page-all", Type: "bool", Desc: "automatically paginate through all pages (capped by --page-limit)"},
+		{Name: "page-limit", Type: "int", Default: "10", Desc: "max pages to fetch with --page-all (default 10, 0 = unlimited)"},
+	},
+	Tips: []string{
+		"Default fetches a single page (matches other list shortcuts in this CLI); pass --page-all to pull every page.",
+		"The underlying API never returns the my_library personal library; resolve it via `wiki spaces get --params '{\"space_id\":\"my_library\"}'`.",
+	},
+	Validate: func(ctx context.Context, runtime *common.RuntimeContext) error {
+		return validateWikiListPagination(runtime, wikiSpaceListMaxPageSize)
+	},
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
-		return common.NewDryRunAPI().
-			GET("/open-apis/wiki/v2/spaces").
-			Params(map[string]interface{}{"page_size": 50})
+		params := map[string]interface{}{"page_size": runtime.Int("page-size")}
+		if pt := strings.TrimSpace(runtime.Str("page-token")); pt != "" {
+			params["page_token"] = pt
+		}
+		dry := common.NewDryRunAPI()
+		// Auto-pagination is the default — make it explicit in the dry-run so
+		// callers can see whether the loop will fire.
+		if wikiListShouldAutoPaginate(runtime) {
+			dry.Desc("Auto-paginates through all pages (capped by --page-limit when > 0)")
+		}
+		return dry.GET(wikiSpaceListAPIPath).Params(params)
 	},
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
-		var spaces []map[string]interface{}
-		pageToken := ""
-		for {
-			params := map[string]interface{}{"page_size": 50}
-			if pageToken != "" {
-				params["page_token"] = pageToken
-			}
-			data, err := runtime.CallAPI("GET", "/open-apis/wiki/v2/spaces", params, nil)
-			if err != nil {
-				return err
-			}
-			items, _ := data["items"].([]interface{})
-			for _, item := range items {
-				if m, ok := item.(map[string]interface{}); ok {
-					spaces = append(spaces, parseWikiSpaceItem(m))
-				}
-			}
-			next, _ := data["page_token"].(string)
-			hasMore, _ := data["has_more"].(bool)
-			if !hasMore || next == "" {
-				break
-			}
-			pageToken = next
+		spaces, hasMore, nextToken, err := fetchWikiSpaces(runtime)
+		if err != nil {
+			return err
 		}
 		fmt.Fprintf(runtime.IO().ErrOut, "Found %d wiki space(s)\n", len(spaces))
-		runtime.Out(map[string]interface{}{
-			"spaces": spaces,
-			"total":  len(spaces),
-		}, nil)
+		outData := map[string]interface{}{
+			"spaces":     spaces,
+			"has_more":   hasMore,
+			"page_token": nextToken,
+		}
+		runtime.OutFormat(outData, &output.Meta{Count: len(spaces)}, func(w io.Writer) {
+			renderWikiSpacesPretty(w, spaces, hasMore, nextToken)
+		})
 		return nil
 	},
+}
+
+// fetchWikiSpaces honours the four pagination flags:
+//   - --page-token X: fetch a single page starting at X
+//   - --page-all=false: fetch a single page from the start
+//   - --page-all=true (default) + --page-limit=0: pull every page
+//   - --page-all=true + --page-limit=N (N>0): cap the loop at N pages and
+//     surface has_more / page_token so the caller can resume.
+func fetchWikiSpaces(runtime *common.RuntimeContext) ([]map[string]interface{}, bool, string, error) {
+	pageSize := runtime.Int("page-size")
+	startToken := strings.TrimSpace(runtime.Str("page-token"))
+	auto := wikiListShouldAutoPaginate(runtime)
+	pageLimit := runtime.Int("page-limit")
+
+	var (
+		spaces        []map[string]interface{}
+		pageToken     = startToken
+		lastHasMore   bool
+		lastPageToken string
+	)
+	for page := 0; ; page++ {
+		params := map[string]interface{}{"page_size": pageSize}
+		if pageToken != "" {
+			params["page_token"] = pageToken
+		}
+		data, err := runtime.CallAPI("GET", wikiSpaceListAPIPath, params, nil)
+		if err != nil {
+			return nil, false, "", err
+		}
+		items, _ := data["items"].([]interface{})
+		for _, item := range items {
+			if m, ok := item.(map[string]interface{}); ok {
+				spaces = append(spaces, parseWikiSpaceItem(m))
+			}
+		}
+		lastHasMore, _ = data["has_more"].(bool)
+		lastPageToken, _ = data["page_token"].(string)
+		if !auto {
+			break
+		}
+		if !lastHasMore || lastPageToken == "" {
+			break
+		}
+		if pageLimit > 0 && page+1 >= pageLimit {
+			break
+		}
+		pageToken = lastPageToken
+	}
+	return spaces, lastHasMore, lastPageToken, nil
 }
 
 func parseWikiSpaceItem(m map[string]interface{}) map[string]interface{} {
@@ -67,4 +131,54 @@ func parseWikiSpaceItem(m map[string]interface{}) map[string]interface{} {
 		"visibility":   common.GetString(m, "visibility"),
 		"open_sharing": common.GetString(m, "open_sharing"),
 	}
+}
+
+func renderWikiSpacesPretty(w io.Writer, spaces []map[string]interface{}, hasMore bool, pageToken string) {
+	if len(spaces) == 0 {
+		fmt.Fprintln(w, "No wiki spaces found.")
+		return
+	}
+	for i, s := range spaces {
+		fmt.Fprintf(w, "[%d] %s\n", i+1, valueOrDash(s["name"]))
+		fmt.Fprintf(w, "    space_id:    %s\n", valueOrDash(s["space_id"]))
+		fmt.Fprintf(w, "    space_type:  %s\n", valueOrDash(s["space_type"]))
+		fmt.Fprintf(w, "    visibility:  %s\n", valueOrDash(s["visibility"]))
+		fmt.Fprintf(w, "    open_share:  %s\n", valueOrDash(s["open_sharing"]))
+		if desc, _ := s["description"].(string); desc != "" {
+			fmt.Fprintf(w, "    description: %s\n", desc)
+		}
+		fmt.Fprintln(w)
+	}
+	if hasMore && pageToken != "" {
+		fmt.Fprintf(w, "Next page token: %s\n", pageToken)
+	}
+}
+
+func valueOrDash(v interface{}) string {
+	if s, ok := v.(string); ok && s != "" {
+		return s
+	}
+	return "-"
+}
+
+// validateWikiListPagination performs flag-level validation shared by
+// +space-list and +node-list.
+func validateWikiListPagination(runtime *common.RuntimeContext, maxPageSize int) error {
+	if n := runtime.Int("page-size"); n < 1 || n > maxPageSize {
+		return common.FlagErrorf("--page-size must be between 1 and %d", maxPageSize)
+	}
+	if n := runtime.Int("page-limit"); n < 0 {
+		return common.FlagErrorf("--page-limit must be a non-negative integer")
+	}
+	return nil
+}
+
+// wikiListShouldAutoPaginate reports whether the fetch loop should keep
+// requesting additional pages. An explicit --page-token disables auto loop
+// because the caller has supplied a specific cursor.
+func wikiListShouldAutoPaginate(runtime *common.RuntimeContext) bool {
+	if strings.TrimSpace(runtime.Str("page-token")) != "" {
+		return false
+	}
+	return runtime.Bool("page-all")
 }

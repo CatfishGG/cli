@@ -5,6 +5,8 @@ package wiki
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -65,9 +67,13 @@ func TestWikiSpaceListReturnsPaginatedSpaces(t *testing.T) {
 	var envelope struct {
 		OK   bool `json:"ok"`
 		Data struct {
-			Spaces []map[string]interface{} `json:"spaces"`
-			Total  float64                  `json:"total"`
+			Spaces    []map[string]interface{} `json:"spaces"`
+			HasMore   bool                     `json:"has_more"`
+			PageToken string                   `json:"page_token"`
 		} `json:"data"`
+		Meta struct {
+			Count float64 `json:"count"`
+		} `json:"meta"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
 		t.Fatalf("unmarshal stdout: %v", err)
@@ -75,8 +81,11 @@ func TestWikiSpaceListReturnsPaginatedSpaces(t *testing.T) {
 	if !envelope.OK {
 		t.Fatalf("expected ok=true, got %s", stdout.String())
 	}
-	if envelope.Data.Total != 2 {
-		t.Fatalf("total = %v, want 2", envelope.Data.Total)
+	if envelope.Meta.Count != 2 {
+		t.Fatalf("meta.count = %v, want 2", envelope.Meta.Count)
+	}
+	if envelope.Data.HasMore {
+		t.Fatalf("has_more = true, want false on natural end")
 	}
 	if envelope.Data.Spaces[0]["name"] != "Engineering Wiki" {
 		t.Fatalf("spaces[0].name = %v, want %q", envelope.Data.Spaces[0]["name"], "Engineering Wiki")
@@ -144,9 +153,13 @@ func TestWikiNodeListReturnsNodesForSpace(t *testing.T) {
 	var envelope struct {
 		OK   bool `json:"ok"`
 		Data struct {
-			Nodes []map[string]interface{} `json:"nodes"`
-			Total float64                  `json:"total"`
+			Nodes     []map[string]interface{} `json:"nodes"`
+			HasMore   bool                     `json:"has_more"`
+			PageToken string                   `json:"page_token"`
 		} `json:"data"`
+		Meta struct {
+			Count float64 `json:"count"`
+		} `json:"meta"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
 		t.Fatalf("unmarshal stdout: %v", err)
@@ -154,8 +167,8 @@ func TestWikiNodeListReturnsNodesForSpace(t *testing.T) {
 	if !envelope.OK {
 		t.Fatalf("expected ok=true, got %s", stdout.String())
 	}
-	if envelope.Data.Total != 2 {
-		t.Fatalf("total = %v, want 2", envelope.Data.Total)
+	if envelope.Meta.Count != 2 {
+		t.Fatalf("meta.count = %v, want 2", envelope.Meta.Count)
 	}
 	if envelope.Data.Nodes[0]["title"] != "Getting Started" {
 		t.Fatalf("nodes[0].title = %v, want %q", envelope.Data.Nodes[0]["title"], "Getting Started")
@@ -284,14 +297,16 @@ func TestWikiNodeListResolvesMyLibraryForUser(t *testing.T) {
 		OK   bool `json:"ok"`
 		Data struct {
 			Nodes []map[string]interface{} `json:"nodes"`
-			Total float64                  `json:"total"`
 		} `json:"data"`
+		Meta struct {
+			Count float64 `json:"count"`
+		} `json:"meta"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
 		t.Fatalf("unmarshal stdout: %v", err)
 	}
-	if envelope.Data.Total != 1 {
-		t.Fatalf("total = %v, want 1", envelope.Data.Total)
+	if envelope.Meta.Count != 1 {
+		t.Fatalf("meta.count = %v, want 1", envelope.Meta.Count)
 	}
 	if envelope.Data.Nodes[0]["space_id"] != "space_personal_42" {
 		t.Fatalf("nodes[0].space_id = %v, want space_personal_42", envelope.Data.Nodes[0]["space_id"])
@@ -444,5 +459,322 @@ func TestWikiNodeCopyCopiesNodeToTargetParent(t *testing.T) {
 	}
 	if _, hasTitle := captured["title"]; hasTitle {
 		t.Fatalf("title should not be in body when --title not provided, got %v", captured)
+	}
+}
+
+// ── +space-list / +node-list pagination & format ─────────────────────────────
+
+func TestWikiSpaceListRejectsInvalidPageSize(t *testing.T) {
+	t.Parallel()
+
+	factory, _, _, _ := cmdutil.TestFactory(t, wikiTestConfig())
+	err := mountAndRunWiki(t, WikiSpaceList, []string{
+		"+space-list", "--page-size", "0", "--as", "bot",
+	}, factory, nil)
+	if err == nil || !strings.Contains(err.Error(), "--page-size must be between 1 and 50") {
+		t.Fatalf("expected page-size validation error, got %v", err)
+	}
+}
+
+func TestWikiSpaceListRejectsNegativePageLimit(t *testing.T) {
+	t.Parallel()
+
+	factory, _, _, _ := cmdutil.TestFactory(t, wikiTestConfig())
+	err := mountAndRunWiki(t, WikiSpaceList, []string{
+		"+space-list", "--page-limit", "-1", "--as", "bot",
+	}, factory, nil)
+	if err == nil || !strings.Contains(err.Error(), "--page-limit must be a non-negative integer") {
+		t.Fatalf("expected page-limit validation error, got %v", err)
+	}
+}
+
+func TestWikiSpaceListAutoPaginatesAcrossPages(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	factory, stdout, _, reg := cmdutil.TestFactory(t, wikiTestConfig())
+
+	// Page 1: has_more=true, page_token set. Loop must continue.
+	page1 := &httpmock.Stub{
+		Method: "GET",
+		URL:    "/open-apis/wiki/v2/spaces",
+		Body: map[string]interface{}{
+			"code": 0, "msg": "success",
+			"data": map[string]interface{}{
+				"has_more":   true,
+				"page_token": "tok_page2",
+				"items": []interface{}{
+					map[string]interface{}{"space_id": "sp_1", "name": "First"},
+				},
+			},
+		},
+	}
+	// Page 2: must receive page_token=tok_page2 in query. Captured to verify.
+	var page2Query string
+	page2 := &httpmock.Stub{
+		Method:  "GET",
+		URL:     "/open-apis/wiki/v2/spaces",
+		OnMatch: func(req *http.Request) { page2Query = req.URL.RawQuery },
+		Body: map[string]interface{}{
+			"code": 0, "msg": "success",
+			"data": map[string]interface{}{
+				"has_more":   false,
+				"page_token": "",
+				"items": []interface{}{
+					map[string]interface{}{"space_id": "sp_2", "name": "Second"},
+				},
+			},
+		},
+	}
+	reg.Register(page1)
+	reg.Register(page2)
+
+	err := mountAndRunWiki(t, WikiSpaceList, []string{"+space-list", "--page-all", "--as", "bot"}, factory, stdout)
+	if err != nil {
+		t.Fatalf("mountAndRunWiki() error = %v", err)
+	}
+
+	var envelope struct {
+		Data struct {
+			Spaces    []map[string]interface{} `json:"spaces"`
+			HasMore   bool                     `json:"has_more"`
+			PageToken string                   `json:"page_token"`
+		} `json:"data"`
+		Meta struct {
+			Count float64 `json:"count"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("unmarshal stdout: %v", err)
+	}
+	if envelope.Meta.Count != 2 || len(envelope.Data.Spaces) != 2 {
+		t.Fatalf("merged spaces = %d / count=%v, want 2 / 2", len(envelope.Data.Spaces), envelope.Meta.Count)
+	}
+	if envelope.Data.HasMore || envelope.Data.PageToken != "" {
+		t.Fatalf("natural end should clear has_more/page_token, got has_more=%v page_token=%q", envelope.Data.HasMore, envelope.Data.PageToken)
+	}
+	q, _ := url.ParseQuery(page2Query)
+	if q.Get("page_token") != "tok_page2" {
+		t.Fatalf("page2 page_token = %q, want tok_page2", q.Get("page_token"))
+	}
+}
+
+func TestWikiSpaceListPageLimitTruncatesAndExposesNextCursor(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	factory, stdout, _, reg := cmdutil.TestFactory(t, wikiTestConfig())
+
+	// Only stub page 1; with --page-limit=1, the loop must stop BEFORE
+	// requesting page 2 — and surface has_more/page_token so the caller can resume.
+	reg.Register(&httpmock.Stub{
+		Method: "GET",
+		URL:    "/open-apis/wiki/v2/spaces",
+		Body: map[string]interface{}{
+			"code": 0, "msg": "success",
+			"data": map[string]interface{}{
+				"has_more":   true,
+				"page_token": "tok_next",
+				"items": []interface{}{
+					map[string]interface{}{"space_id": "sp_only", "name": "First"},
+				},
+			},
+		},
+	})
+
+	err := mountAndRunWiki(t, WikiSpaceList, []string{
+		"+space-list", "--page-all", "--page-limit", "1", "--as", "user",
+	}, factory, stdout)
+	if err != nil {
+		t.Fatalf("mountAndRunWiki() error = %v", err)
+	}
+
+	var envelope struct {
+		Data struct {
+			Spaces    []map[string]interface{} `json:"spaces"`
+			HasMore   bool                     `json:"has_more"`
+			PageToken string                   `json:"page_token"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("unmarshal stdout: %v", err)
+	}
+	if len(envelope.Data.Spaces) != 1 {
+		t.Fatalf("spaces = %d, want 1 (capped)", len(envelope.Data.Spaces))
+	}
+	if !envelope.Data.HasMore || envelope.Data.PageToken != "tok_next" {
+		t.Fatalf("truncated state = has_more=%v page_token=%q, want true / tok_next", envelope.Data.HasMore, envelope.Data.PageToken)
+	}
+}
+
+func TestWikiSpaceListExplicitPageTokenStopsAfterOnePage(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	factory, stdout, _, reg := cmdutil.TestFactory(t, wikiTestConfig())
+
+	// Stub a page where has_more=true; auto-pagination should NOT trigger
+	// because the caller supplied an explicit --page-token cursor.
+	var capturedQuery string
+	reg.Register(&httpmock.Stub{
+		Method:  "GET",
+		URL:     "/open-apis/wiki/v2/spaces",
+		OnMatch: func(req *http.Request) { capturedQuery = req.URL.RawQuery },
+		Body: map[string]interface{}{
+			"code": 0, "msg": "success",
+			"data": map[string]interface{}{
+				"has_more":   true,
+				"page_token": "tok_next",
+				"items":      []interface{}{map[string]interface{}{"space_id": "sp_x"}},
+			},
+		},
+	})
+
+	err := mountAndRunWiki(t, WikiSpaceList, []string{
+		"+space-list", "--page-token", "tok_input", "--as", "user",
+	}, factory, stdout)
+	if err != nil {
+		t.Fatalf("mountAndRunWiki() error = %v", err)
+	}
+
+	q, _ := url.ParseQuery(capturedQuery)
+	if q.Get("page_token") != "tok_input" {
+		t.Fatalf("captured page_token = %q, want tok_input", q.Get("page_token"))
+	}
+}
+
+func TestWikiSpaceListPrettyFormatRendersFields(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	factory, stdout, _, reg := cmdutil.TestFactory(t, wikiTestConfig())
+	reg.Register(&httpmock.Stub{
+		Method: "GET",
+		URL:    "/open-apis/wiki/v2/spaces",
+		Body: map[string]interface{}{
+			"code": 0, "msg": "success",
+			"data": map[string]interface{}{
+				"has_more": false,
+				"items": []interface{}{
+					map[string]interface{}{
+						"space_id":     "sp_1",
+						"name":         "Engineering",
+						"description":  "team docs",
+						"space_type":   "team",
+						"visibility":   "public",
+						"open_sharing": "open",
+					},
+				},
+			},
+		},
+	})
+
+	err := mountAndRunWiki(t, WikiSpaceList, []string{
+		"+space-list", "--format", "pretty", "--as", "user",
+	}, factory, stdout)
+	if err != nil {
+		t.Fatalf("mountAndRunWiki() error = %v", err)
+	}
+
+	out := stdout.String()
+	for _, want := range []string{
+		"Engineering",
+		"space_id:    sp_1",
+		"space_type:  team",
+		"visibility:  public",
+		"description: team docs",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("pretty output missing %q, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestWikiNodeListDefaultIsSinglePage(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	factory, stdout, _, reg := cmdutil.TestFactory(t, wikiTestConfig())
+
+	// Only one stub registered; if the default tried to auto-paginate, the
+	// loop would attempt a 2nd request and httpmock would error. So this
+	// test pins down the "default = single page" contract.
+	reg.Register(&httpmock.Stub{
+		Method: "GET",
+		URL:    "/open-apis/wiki/v2/spaces/space_123/nodes",
+		Body: map[string]interface{}{
+			"code": 0, "msg": "success",
+			"data": map[string]interface{}{
+				"has_more":   true,
+				"page_token": "tok_next",
+				"items": []interface{}{
+					map[string]interface{}{"space_id": "space_123", "node_token": "wik_1", "title": "First"},
+				},
+			},
+		},
+	})
+
+	err := mountAndRunWiki(t, WikiNodeList, []string{
+		"+node-list", "--space-id", "space_123", "--as", "bot",
+	}, factory, stdout)
+	if err != nil {
+		t.Fatalf("mountAndRunWiki() error = %v", err)
+	}
+
+	var envelope struct {
+		Data struct {
+			Nodes     []map[string]interface{} `json:"nodes"`
+			HasMore   bool                     `json:"has_more"`
+			PageToken string                   `json:"page_token"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("unmarshal stdout: %v", err)
+	}
+	if len(envelope.Data.Nodes) != 1 {
+		t.Fatalf("nodes = %d, want 1 (single page default)", len(envelope.Data.Nodes))
+	}
+	if !envelope.Data.HasMore || envelope.Data.PageToken != "tok_next" {
+		t.Fatalf("single-page default should surface upstream cursor, got has_more=%v page_token=%q", envelope.Data.HasMore, envelope.Data.PageToken)
+	}
+}
+
+func TestWikiNodeListPrettyFormatRendersFields(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	factory, stdout, _, reg := cmdutil.TestFactory(t, wikiTestConfig())
+	reg.Register(&httpmock.Stub{
+		Method: "GET",
+		URL:    "/open-apis/wiki/v2/spaces/space_123/nodes",
+		Body: map[string]interface{}{
+			"code": 0, "msg": "success",
+			"data": map[string]interface{}{
+				"has_more": false,
+				"items": []interface{}{
+					map[string]interface{}{
+						"space_id":   "space_123",
+						"node_token": "wik_1",
+						"obj_type":   "docx",
+						"obj_token":  "docx_1",
+						"title":      "Getting Started",
+						"has_child":  true,
+					},
+				},
+			},
+		},
+	})
+
+	err := mountAndRunWiki(t, WikiNodeList, []string{
+		"+node-list", "--space-id", "space_123", "--format", "pretty", "--as", "bot",
+	}, factory, stdout)
+	if err != nil {
+		t.Fatalf("mountAndRunWiki() error = %v", err)
+	}
+
+	out := stdout.String()
+	for _, want := range []string{
+		"Getting Started",
+		"node_token: wik_1",
+		"obj_type:   docx",
+		"has_child:  true",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("pretty output missing %q, got:\n%s", want, out)
+		}
 	}
 }
