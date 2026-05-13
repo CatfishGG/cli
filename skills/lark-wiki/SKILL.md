@@ -60,7 +60,6 @@ Shortcut 是对常用操作的高级封装（`lark-cli wiki +<verb> [flags]`）�
 | [`+space-list`](references/lark-wiki-space-list.md) | List all wiki spaces accessible to the caller |
 | [`+node-list`](references/lark-wiki-node-list.md) | List wiki nodes in a space or under a parent node (supports pagination) |
 | [`+node-copy`](references/lark-wiki-node-copy.md) | Copy a wiki node to a target space or parent node |
-| [`+node-move`](references/lark-wiki-node-move.md) | Move a wiki node (and subtree) to a target space or parent node |
 
 ## API Resources
 
