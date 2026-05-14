@@ -778,3 +778,139 @@ func TestWikiNodeListPrettyFormatRendersFields(t *testing.T) {
 		}
 	}
 }
+
+// ── QA-driven fixes: empty slice + has_more hint + node-copy format ──
+
+func TestWikiSpaceListEmptyResultReturnsEmptySliceNotNull(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	factory, stdout, _, reg := cmdutil.TestFactory(t, wikiTestConfig())
+	reg.Register(&httpmock.Stub{
+		Method: "GET",
+		URL:    "/open-apis/wiki/v2/spaces",
+		Body: map[string]interface{}{
+			"code": 0, "msg": "success",
+			"data": map[string]interface{}{
+				"has_more":   false,
+				"page_token": "",
+				"items":      []interface{}{},
+			},
+		},
+	})
+
+	err := mountAndRunWiki(t, WikiSpaceList, []string{"+space-list", "--as", "bot"}, factory, stdout)
+	if err != nil {
+		t.Fatalf("mountAndRunWiki() error = %v", err)
+	}
+
+	// Substring assertion is the only reliable way to distinguish [] from null
+	// in serialised JSON — unmarshalling both back into a Go slice would
+	// collapse the distinction.
+	if !strings.Contains(stdout.String(), `"spaces": []`) {
+		t.Fatalf("expected spaces to be empty array [], got:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), `"spaces": null`) {
+		t.Fatalf("spaces serialised as null — JSON consumers expect []:\n%s", stdout.String())
+	}
+
+	var envelope struct {
+		Meta struct {
+			Count float64 `json:"count"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("unmarshal stdout: %v", err)
+	}
+	if envelope.Meta.Count != 0 {
+		t.Fatalf("meta.count = %v, want 0", envelope.Meta.Count)
+	}
+}
+
+func TestWikiSpaceListPrettyHintsWhenEmptyButHasMore(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	factory, stdout, _, reg := cmdutil.TestFactory(t, wikiTestConfig())
+	reg.Register(&httpmock.Stub{
+		Method: "GET",
+		URL:    "/open-apis/wiki/v2/spaces",
+		Body: map[string]interface{}{
+			"code": 0, "msg": "success",
+			"data": map[string]interface{}{
+				"has_more":   true,
+				"page_token": "tok_more",
+				"items":      []interface{}{},
+			},
+		},
+	})
+
+	err := mountAndRunWiki(t, WikiSpaceList, []string{"+space-list", "--format", "pretty", "--as", "bot"}, factory, stdout)
+	if err != nil {
+		t.Fatalf("mountAndRunWiki() error = %v", err)
+	}
+
+	out := stdout.String()
+	// When the bot's first page is filtered out by upstream permissions, the
+	// blanket "No wiki spaces found." used to mislead users into thinking they
+	// had no access at all. Pretty mode must now distinguish that case.
+	if strings.Contains(out, "No wiki spaces found.") {
+		t.Fatalf("pretty output should not flatly claim 'No wiki spaces found.' when has_more=true; got:\n%s", out)
+	}
+	for _, want := range []string{
+		"Current page is empty but the server reports more pages.",
+		"tok_more",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("pretty output missing %q, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestWikiNodeCopyHasFormatPrettyRendersNode(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	factory, stdout, _, reg := cmdutil.TestFactory(t, wikiTestConfig())
+	reg.Register(&httpmock.Stub{
+		Method: "POST",
+		URL:    "/open-apis/wiki/v2/spaces/space_src/nodes/wik_src/copy",
+		Body: map[string]interface{}{
+			"code": 0, "msg": "success",
+			"data": map[string]interface{}{
+				"node": map[string]interface{}{
+					"space_id":          "space_dst",
+					"node_token":        "wik_copied",
+					"obj_token":         "docx_copied",
+					"obj_type":          "docx",
+					"parent_node_token": "wik_parent",
+					"node_type":         "origin",
+					"title":             "Architecture (Copy)",
+				},
+			},
+		},
+	})
+
+	err := mountAndRunWiki(t, WikiNodeCopy, []string{
+		"+node-copy",
+		"--space-id", "space_src",
+		"--node-token", "wik_src",
+		"--target-space-id", "space_dst",
+		"--title", "Architecture (Copy)",
+		"--format", "pretty",
+		"--as", "bot",
+	}, factory, stdout)
+	if err != nil {
+		t.Fatalf("mountAndRunWiki() error = %v", err)
+	}
+
+	out := stdout.String()
+	for _, want := range []string{
+		"Copied node:",
+		"title:             Architecture (Copy)",
+		"node_token:        wik_copied",
+		"space_id:          space_dst",
+		"parent_node_token: wik_parent",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("pretty output missing %q, got:\n%s", want, out)
+		}
+	}
+}

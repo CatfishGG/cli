@@ -22,6 +22,7 @@ lark-cli wiki +node-copy \
 | `--target-space-id` | Conditional | Target space ID. Required if `--target-parent-node-token` is not set |
 | `--target-parent-node-token` | Conditional | Target parent node token. Required if `--target-space-id` is not set |
 | `--title` | No | New title for the copied node. Omit to keep the original title |
+| `--format` | No | Output format: `json` (default) / `pretty` / `table` / `csv` / `ndjson` |
 | `--as` | No | Identity: `user` or `bot` (default: `user`) |
 
 > At least one of `--target-space-id` or `--target-parent-node-token` must be provided.

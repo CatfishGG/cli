@@ -74,11 +74,11 @@ var WikiSpaceList = common.Shortcut{
 }
 
 // fetchWikiSpaces honours the four pagination flags:
-//   - --page-token X: fetch a single page starting at X
-//   - --page-all=false: fetch a single page from the start
-//   - --page-all=true (default) + --page-limit=0: pull every page
-//   - --page-all=true + --page-limit=N (N>0): cap the loop at N pages and
-//     surface has_more / page_token so the caller can resume.
+//   - default (no --page-all, no --page-token): fetch a single page from the start
+//   - --page-token X: fetch a single page starting at X (auto-pagination disabled)
+//   - --page-all: pull subsequent pages, capped by --page-limit (default 10; 0 = unlimited)
+//
+// The returned slice is always non-nil so json output stays as `[]` instead of `null`.
 func fetchWikiSpaces(runtime *common.RuntimeContext) ([]map[string]interface{}, bool, string, error) {
 	pageSize := runtime.Int("page-size")
 	startToken := strings.TrimSpace(runtime.Str("page-token"))
@@ -86,7 +86,7 @@ func fetchWikiSpaces(runtime *common.RuntimeContext) ([]map[string]interface{}, 
 	pageLimit := runtime.Int("page-limit")
 
 	var (
-		spaces        []map[string]interface{}
+		spaces        = make([]map[string]interface{}, 0)
 		pageToken     = startToken
 		lastHasMore   bool
 		lastPageToken string
@@ -135,6 +135,15 @@ func parseWikiSpaceItem(m map[string]interface{}) map[string]interface{} {
 
 func renderWikiSpacesPretty(w io.Writer, spaces []map[string]interface{}, hasMore bool, pageToken string) {
 	if len(spaces) == 0 {
+		// Distinguish "nothing here" from "current page empty but server says
+		// more pages follow" — the latter is a hint to keep paginating instead
+		// of giving up.
+		if hasMore && pageToken != "" {
+			fmt.Fprintln(w, "Current page is empty but the server reports more pages.")
+			fmt.Fprintln(w, "Pass --page-all to walk every page, or --page-token to resume from the cursor below:")
+			fmt.Fprintf(w, "  next page_token: %s\n", pageToken)
+			return
+		}
 		fmt.Fprintln(w, "No wiki spaces found.")
 		return
 	}

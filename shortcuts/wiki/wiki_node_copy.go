@@ -6,6 +6,7 @@ package wiki
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/larksuite/cli/internal/output"
@@ -21,6 +22,7 @@ var WikiNodeCopy = common.Shortcut{
 	Risk:        "write",
 	Scopes:      []string{"wiki:node:copy"},
 	AuthTypes:   []string{"user", "bot"},
+	HasFormat:   true,
 	Flags: []common.Flag{
 		{Name: "space-id", Desc: "source wiki space ID", Required: true},
 		{Name: "node-token", Desc: "source node token to copy", Required: true},
@@ -86,9 +88,24 @@ var WikiNodeCopy = common.Shortcut{
 
 		fmt.Fprintf(runtime.IO().ErrOut, "Copied to node %s in space %s\n",
 			common.MaskToken(node.NodeToken), common.MaskToken(node.SpaceID))
-		runtime.Out(wikiNodeCopyOutput(node), nil)
+		out := wikiNodeCopyOutput(node)
+		runtime.OutFormat(out, nil, func(w io.Writer) {
+			renderWikiNodeCopyPretty(w, out)
+		})
 		return nil
 	},
+}
+
+func renderWikiNodeCopyPretty(w io.Writer, out map[string]interface{}) {
+	fmt.Fprintf(w, "Copied node:\n")
+	fmt.Fprintf(w, "  title:             %s\n", valueOrDash(out["title"]))
+	fmt.Fprintf(w, "  node_token:        %s\n", valueOrDash(out["node_token"]))
+	fmt.Fprintf(w, "  space_id:          %s\n", valueOrDash(out["space_id"]))
+	fmt.Fprintf(w, "  obj_type:          %s\n", valueOrDash(out["obj_type"]))
+	fmt.Fprintf(w, "  obj_token:         %s\n", valueOrDash(out["obj_token"]))
+	if parent, _ := out["parent_node_token"].(string); parent != "" {
+		fmt.Fprintf(w, "  parent_node_token: %s\n", parent)
+	}
 }
 
 func buildNodeCopyBody(runtime *common.RuntimeContext) map[string]interface{} {

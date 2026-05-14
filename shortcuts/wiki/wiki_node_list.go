@@ -131,8 +131,9 @@ func fetchWikiNodes(runtime *common.RuntimeContext, spaceID string) ([]map[strin
 
 	apiPath := fmt.Sprintf("/open-apis/wiki/v2/spaces/%s/nodes", validate.EncodePathSegment(spaceID))
 
+	// Non-nil empty slice keeps json output stable as `[]` instead of `null`.
 	var (
-		nodes         []map[string]interface{}
+		nodes         = make([]map[string]interface{}, 0)
 		pageToken     = startToken
 		lastHasMore   bool
 		lastPageToken string
@@ -186,6 +187,12 @@ func wikiNodeListItem(m map[string]interface{}) map[string]interface{} {
 
 func renderWikiNodesPretty(w io.Writer, nodes []map[string]interface{}, hasMore bool, pageToken string) {
 	if len(nodes) == 0 {
+		if hasMore && pageToken != "" {
+			fmt.Fprintln(w, "Current page is empty but the server reports more pages.")
+			fmt.Fprintln(w, "Pass --page-all to walk every page, or --page-token to resume from the cursor below:")
+			fmt.Fprintf(w, "  next page_token: %s\n", pageToken)
+			return
+		}
 		fmt.Fprintln(w, "No wiki nodes found.")
 		return
 	}
