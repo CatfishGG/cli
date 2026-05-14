@@ -75,7 +75,14 @@ func TestWiki_ShortcutWorkflow(t *testing.T) {
 		assert.True(t, out.Get("data.spaces").IsArray(), "data.spaces must be an array, even when empty")
 		assert.True(t, out.Get("data.has_more").Exists(), "data.has_more must always be present")
 		assert.True(t, out.Get("data.page_token").Exists(), "data.page_token must always be present")
-		assert.True(t, out.Get("meta.count").Exists(), "meta.count must always be present")
+		// meta.count uses `json:",omitempty"` in the envelope framework, so the
+		// field is dropped when the count is zero. Comparing values (gjson
+		// returns 0 for missing keys) keeps the assertion correct in both the
+		// "no spaces visible" and "some spaces" cases without requiring a
+		// framework-level change.
+		spacesLen := len(out.Get("data.spaces").Array())
+		assert.Equal(t, float64(spacesLen), out.Get("meta.count").Float(),
+			"meta.count must equal len(data.spaces) (or be omitted when zero); stdout:\n%s", result.Stdout)
 	})
 
 	// QA-P1: +node-list correctly maps flags onto the underlying request body
